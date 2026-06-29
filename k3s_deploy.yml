@@ -1,0 +1,171 @@
+---
+# ========================================================
+# ЭТАП 0: ПОДГОТОВКА СИСТЕМЫ И КАТЕГОРИЧЕСКИЙ ХАРДЕНИНГ SSH
+# ========================================================
+- name: Подготовка сетевого окружения и защита нод
+  hosts: all
+  become: true
+
+  # Подключаем файл с раздельными паролями
+  vars_files:
+    - passwords.yaml
+
+  # 2. Затем объявляем хэндлеры для этого плея
+  handlers:
+    - name: reload sshd
+      systemd:
+        name: ssh
+        state: restarted
+  tasks:
+    - name: 0.1. Вычисляем красивое имя хоста
+      set_fact:
+        node_hostname: "{{ 'k8s-master' if inventory_hostname in groups['masters'] else 'k8s-worker-' ~ (groups['workers'].index(inventory_hostname) + 1) }}"
+
+    - name: 0.2. Устанавливаем новое имя хоста в системе
+      hostname:
+        name: "{{ node_hostname }}"
+
+    - name: 0.3. Прописываем DNS (8.8.8.8 и 1.1.1.1)
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 8.8.8.8
+          nameserver 1.1.1.1
+          options edns0 trust-ad
+
+    - name: 0.4. Фиксируем динамический IP в статику
+      copy:
+        dest: /etc/network/interfaces
+        content: |
+          auto lo
+          iface lo inet loopback
+
+          auto {{ ansible_default_ipv4.interface }}
+          iface {{ ansible_default_ipv4.interface }} inet static
+              address {{ ansible_default_ipv4.address }}
+              netmask {{ ansible_default_ipv4.netmask }}
+              gateway {{ ansible_default_ipv4.gateway }}
+      register: network_config
+
+    - name: 0.5. Безопасно перезапускаем сеть (без разрыва сессии Ansible)
+      systemd:
+        name: networking
+        state: restarted
+      async: 10
+      poll: 0
+      when: network_config.changed
+
+    - name: 0.6. Формируем чистый /etc/hosts для всего кластера
+      copy:
+        dest: /etc/hosts
+        content: |
+          127.0.0.1 localhost
+          ::1 localhost ip6-localhost ip6-loopback
+
+          # К3s Cluster Nodes
+          {% for host in groups['all'] %}
+          {{ hostvars[host]['ansible_host'] }} {{ 'k8s-master' if host in groups['masters'] else 'k8s-worker-' ~ (groups['workers'].index(host) + 1) }}
+          {% endfor %}
+
+    # --------------------------------------------------------
+    # БЛОК БЕЗОПАСНОСТИ (SSH & USERS)
+    # --------------------------------------------------------
+
+    - name: 0.7. Прокидываем публичный SSH-ключ на все ноды
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+
+    - name: 0.8. Меняем пароль пользователя (динамически мастер или воркер)
+      user:
+        name: "{{ ansible_user }}"
+        # Динамический выбор: если хост в группе masters — берем master_password, иначе workers_password
+        password: "{{ (master_password if inventory_hostname in groups['masters'] else workers_password) | password_hash('sha512') }}"
+
+    - name: 0.8b. Обновляем пароль sudo в памяти самого Ansible
+      set_fact:
+        ansible_become_password: "{{ (inventory_hostname in groups['masters']) | ternary(master_password, workers_password) }}"
+
+    - name: 0.9. Полностью блокируем пароль для root (вход только через sudo su)
+      user:
+        name: root
+        password_lock: true
+
+    - name: 0.10. Харденинг SSHD — Запрещаем вход root и логин по паролям
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: "^#?PermitRootLogin", line: "PermitRootLogin no" }
+        - {
+            regexp: "^#?PasswordAuthentication",
+            line: "PasswordAuthentication no",
+          }
+        - {
+            regexp: "^#?ChallengeResponseAuthentication",
+            line: "ChallengeResponseAuthentication no",
+          }
+        - {
+            regexp: "^#?PubkeyAuthentication",
+            line: "PubkeyAuthentication yes",
+          }
+      notify: reload sshd
+
+# ========================================================
+# ЭТАП 1: НАСТРОЙКА МАСТЕР-НОДЫ (Server)
+# ========================================================
+- name: Развертывание K3s Master (Server)
+  hosts: masters
+  become: true
+  tasks:
+    - name: Устанавливаем curl
+      apt:
+        name: curl
+        state: present
+        update_cache: true
+
+    - name: Запускаем официальный скрипт установки K3s в режиме Server
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+        --write-kubeconfig-mode 644 \
+        --node-name={{ node_hostname }} \
+        --node-ip={{ ansible_host }}
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Ждем, пока сгенерируется токен ноды
+      wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+
+    - name: Читаем токен мастера
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_encoded
+
+    - name: Сохраняем чистый токен в global fact
+      set_fact:
+        k3s_token: "{{ k3s_token_encoded.content | b64decode | trim }}"
+
+# ========================================================
+# ЭТАП 2: НАСТРОЙКА ВОРКЕР-НОД (Agents)
+# ========================================================
+- name: Развертывание K3s Workers (Agents)
+  hosts: workers
+  become: true
+  tasks:
+    - name: Устанавливаем curl на воркеры
+      apt:
+        name: curl
+        state: present
+
+    - name: Запускаем скрипт установки K3s в режиме Agent (подключаем к Мастеру)
+      shell: |
+        curl -sfL https://get.k3s.io | K3S_URL="https://{{ hostvars[groups['masters'][0]]['ansible_host'] }}:6443" K3S_TOKEN="{{ hostvars[groups['masters'][0]]['k3s_token'] }}" sh -s - agent \
+        --node-name={{ node_hostname }} \
+        --with-node-id \
+        --node-ip={{ ansible_host }}
+      args:
+        creates: /usr/local/bin/k3s

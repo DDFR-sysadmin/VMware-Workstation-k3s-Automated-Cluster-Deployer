@@ -1,0 +1,5 @@
+vmware_username = ""
+vmware_password = ""
+vm_base_dir = ""
+parent_id_deb = ""
+vmware_exe_path = ""
