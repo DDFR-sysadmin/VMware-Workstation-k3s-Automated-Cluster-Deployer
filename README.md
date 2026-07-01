@@ -93,8 +93,8 @@
 
 1. Склонируйте репозиторий в рабочую директорию на Windows:
    ```bash
-   git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
-   cd your-repo-name
+   git clone https://github.com/DDFR-sysadmin/VMware-Workstation-k3s-Automated-Cluster-Deployer
+   cd VMware-Workstation-k3s-Automated-Cluster-Deployer
 
    ```
 
